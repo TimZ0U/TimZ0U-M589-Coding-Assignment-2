@@ -71,7 +71,7 @@ def solve(A, b):
         raise ValueError("A must be two-dimensional")
     m, n = A.shape
 
-    # Shape/convert b
+    # Normalize/validate b
     b_arr = np.asarray(b)
     if b_arr.ndim == 1:
         if b_arr.size != m:
@@ -84,100 +84,97 @@ def solve(A, b):
         raise ValueError("b must be one- or two-dimensional")
     k = b_arr.shape[1]
 
-    # Edge: m == 0 (no equations) ⇒ any x works; choose c = 0, N = I
+    # Edge: no equations
     if m == 0:
         if b_arr.size != 0:
             raise ValueError("inconsistent system: no equations but nonzero b")
-        N = np.eye(n, dtype=A.dtype)
-        c = np.zeros((n, k), dtype=A.dtype)
+        N = np.eye(int(n), dtype=A.dtype)               # (n,n), 2-D
+        c = np.zeros((int(n), k), dtype=A.dtype)
         return N, (c.reshape(n) if k == 1 else c)
 
-    # Edge: n == 0 (no variables) ⇒ only consistent if b ≈ 0
+    # Edge: no variables
     if n == 0:
         eps0 = np.finfo(A.real.dtype).eps
         scaleb0 = np.max(np.abs(b_arr)) if b_arr.size else 1.0
         tol0 = max(m, n) * eps0 * max(1.0, scaleb0)
         if b_arr.size and np.linalg.norm(b_arr, ord=np.inf) > tol0:
             raise ValueError("inconsistent system: no variables but nonzero b")
-        N = np.zeros((0, 0), dtype=A.dtype)
+        N = np.zeros((0, 0), dtype=A.dtype)             # (0,0), 2-D
         c = np.zeros((0, k), dtype=A.dtype)
         return N, (c.reshape(0) if k == 1 else c)
 
-    # Work on a copy for in-place PAQ=LU
+    # PAQ = LU (in-place) on a copy
     A_work = np.array(A, copy=True)
     P, Q, A_work = paqlu_decomposition_in_place(A_work)
 
-    # Robust solve-stage tolerance (don’t rely solely on _last_paqlu_tol)
+    # Robust solve tolerance; don't trust only the PAQ-side tol
     eps = np.finfo(A.real.dtype).eps
     scaleA = np.max(np.abs(A_work)) if A_work.size else 1.0
     scaleb = np.max(np.abs(b_arr)) if b_arr.size else 1.0
     tol_solve = max(m, n) * eps * max(scaleA, scaleb)
-    tol = max(globals().get('_last_paqlu_tol', 0.0), tol_solve)
+    tol = max(float(globals().get('_last_paqlu_tol', 0.0)), tol_solve)
 
-    # Rank (prefer what PAQ computed; otherwise fallback using tol)
-    r = globals().get('_last_paqlu_rank', None)
-    if r is None:
-        r = 0
-        lim = min(m, n)
-        for i in range(lim):
-            if np.abs(A_work[P[i], Q[i]]) > tol:
-                r += 1
-            else:
-                break
+    # ALWAYS recompute rank with the CURRENT tol to avoid zero pivots later
+    r = 0
+    lim = min(m, n)
+    for i in range(lim):
+        if np.abs(A_work[P[i], Q[i]]) > tol:
+            r += 1
+        else:
+            break
 
-    # Forward substitution: L has unit diagonal; multipliers stored below
+    # Forward substitution: L has implicit unit diagonal, multipliers stored below
     y = b_arr[P, :].astype(A.dtype, copy=True)
     for i in range(m):
-        jmax = min(i, r)  # only the first r columns are pivots
+        jmax = min(i, r)                    # only pivot cols contribute
         if jmax > 0:
-            L_row = A_work[P[i], Q[:jmax]]          # shape (jmax,)
-            y[i, :] -= L_row @ y[:jmax, :]          # subtract known part
+            L_row = A_work[P[i], Q[:jmax]]  # (jmax,)
+            y[i, :] -= L_row @ y[:jmax, :]
 
-    # Inconsistency check: zero rows (below r) must produce zero RHS
+    # Inconsistency: any zero row (below r) must have zero RHS within tol
     if r < m and y[r:, :].size:
         if np.linalg.norm(y[r:, :], ord=np.inf) > tol:
             raise ValueError("inconsistent system: A x = b has no solution")
 
     # Back substitution on U (pivot block)
-    U_piv = A_work[np.ix_(P[:r], Q[:r])]            # r x r upper-triangular
+    U_piv = A_work[np.ix_(P[:r], Q[:r])]    # (r,r), upper-triangular
     z = np.zeros((r, k), dtype=A.dtype)
     for i in range(r - 1, -1, -1):
+        piv = U_piv[i, i]
+        if np.abs(piv) <= tol:
+            # With rank recomputed against tol, this should not happen
+            raise ValueError("inconsistent system: zero pivot encountered")
         rhs = y[i, :].copy()
         if i + 1 < r:
             rhs -= U_piv[i, i + 1 : r] @ z[i + 1 : r, :]
-        piv = U_piv[i, i]
-        if np.abs(piv) <= tol:
-            raise ValueError("inconsistent system: zero pivot encountered")
         z[i, :] = rhs / piv
 
-    # Particular solution in original column order
+    # Particular solution in original variable order
     x_perm = np.zeros((n, k), dtype=A.dtype)
-    x_perm[:r, :] = z                               # pivot vars
+    x_perm[:r, :] = z
     c = np.zeros((n, k), dtype=A.dtype)
-    c[Q, :] = x_perm                                # inverse permute by Q
+    c[Q, :] = x_perm
     if k == 1:
-        c = c.reshape(n)
+        c = c.reshape(n)                     # keep c 1-D for a single RHS
 
-    # Nullspace basis N (size n x f, with f = n - r)
-    f = n - r
-    N = np.zeros((n, f), dtype=A.dtype)
+    # Nullspace basis N: shape (n, f), always 2-D
+    f = int(n - r)
+    N = np.zeros((int(n), f), dtype=A.dtype)
     if f > 0:
-        # U_piv X = -U_free  ⇒ X via back substitution
-        U_free = -A_work[np.ix_(P[:r], Q[r:n])]     # r x f
+        U_free = -A_work[np.ix_(P[:r], Q[r:n])]  # (r, f)
         X = np.zeros((r, f), dtype=A.dtype)
         for i in range(r - 1, -1, -1):
-            rhs = U_free[i, :].copy()
-            if i + 1 < r:
-                rhs -= U_piv[i, i + 1 : r] @ X[i + 1 : r, :]
             piv = U_piv[i, i]
             if np.abs(piv) <= tol:
                 raise ValueError("inconsistent system: zero pivot in nullspace computation")
+            rhs = U_free[i, :].copy()
+            if i + 1 < r:
+                rhs -= U_piv[i, i + 1 : r] @ X[i + 1 : r, :]
             X[i, :] = rhs / piv
 
-        # Stack [X; I_f] in permuted variable order, then inverse-permute by Q
         N_perm = np.zeros((n, f), dtype=A.dtype)
         N_perm[:r, :] = X
         N_perm[r : r + f, :] = np.eye(f, dtype=A.dtype)
-        N[Q, :] = N_perm
+        N[Q, :] = N_perm                       # inverse column-permute
 
     return N, c

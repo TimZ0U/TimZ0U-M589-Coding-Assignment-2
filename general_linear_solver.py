@@ -1,14 +1,6 @@
-
 import numpy as np
 
 def paqlu_decomposition_in_place(A):
-    """
-    In-place PAQ = LU with partial pivoting (rows) AND virtual column pivoting.
-    - Row exchanges are simulated via P (no physical row swaps in A).
-    - Column exchanges are virtual via Q (no physical column swaps in A).
-    - Works for rectangular A (m x n).
-    Returns (P, Q, A) where A stores L (strictly lower, unit diagonal implicit) and U (upper).
-    """
     if not isinstance(A, np.ndarray):
         raise TypeError("A must be a numpy.ndarray")
     if A.ndim != 2:
@@ -19,81 +11,67 @@ def paqlu_decomposition_in_place(A):
     m, n = A.shape
     P = np.arange(m, dtype=int)
     Q = np.arange(n, dtype=int)
-    TOL = 1e-6
+
     r = 0
+    eps = np.finfo(A.real.dtype).eps  # works for real/complex
 
     for k in range(min(m, n)):
-        # Find pivot in the active submatrix: rows k..m-1, cols k..n-1 (virtual columns via Q)
-        if k >= m or k >= n:
+        # Working submatrix (permuted view): rows P[k:], cols Q[k:]
+        # We need its max magnitude to set tol and select the pivot.
+        S_abs = np.abs(A[np.ix_(P[k:], Q[k:])])
+        if S_abs.size == 0:
+            break
+        max_abs = S_abs.max()
+
+        # Adaptive tolerance per spec
+        tol = max(m, n) * eps * max_abs
+
+        # If the whole remaining block is (numerically) zero ⇒ done (rank = r)
+        if max_abs <= tol:
             break
 
-        # Extract the absolute values of the active submatrix without copying rows/cols unnecessarily
-        rows = P[k:m]
-        cols = Q[k:n]
-        if rows.size == 0 or cols.size == 0:
-            break
+        # Choose pivot anywhere in the working block (full pivoting over the block)
+        i_rel, j_rel = np.unravel_index(S_abs.argmax(), S_abs.shape)
+        pivot_row = k + i_rel
+        pivot_col = k + j_rel
 
-        sub_abs = np.abs(A[np.ix_(rows, cols)])
-        flat_idx = sub_abs.argmax()
-        pivot_mag = sub_abs.flat[flat_idx]
-
-        if pivot_mag <= TOL:
-            # No more usable pivots
-            break
-
-        # Determine relative indices within the active block
-        rel_i, rel_j = np.unravel_index(flat_idx, sub_abs.shape)
-        pivot_row = k + rel_i
-        pivot_col = k + rel_j
-
-        # Simulated row swap in P
+        # Bring pivot to (k,k) in the permuted view by updating P and Q
         if pivot_row != k:
             P[[k, pivot_row]] = P[[pivot_row, k]]
-
-        # Virtual column swap in Q
         if pivot_col != k:
             Q[[k, pivot_col]] = Q[[pivot_col, k]]
 
-        # Pivot value at (P[k], Q[k])
-        piv = A[P[k], Q[k]]
-
-        # Eliminate entries below the pivot in column Q[k]
-        for i in range(k + 1, m):
-            a_ik = A[P[i], Q[k]]
-            if piv == 0:
-                L_ik = 0.0
-            else:
-                L_ik = a_ik / piv
-            A[P[i], Q[k]] = L_ik  # store L multiplier
-
-            if L_ik != 0:
-                # Update trailing block across remaining virtual columns
-                for j in range(k + 1, n):
-                    A[P[i], Q[j]] -= L_ik * A[P[k], Q[j]]
+        pivot = A[P[k], Q[k]]
+        # Safety: re-check the chosen pivot vs tol
+        if np.abs(pivot) <= tol:
+            break
 
         r += 1
 
-    # Stash rank and tolerance for the solver
+        # Eliminate below the pivot in the current pivot column (permuted view)
+        for i in range(k + 1, m):
+            L_ik = A[P[i], Q[k]] / pivot
+            A[P[i], Q[k]] = L_ik  # store L multiplier in the (strict) lower part
+            # Update trailing part of row i
+            for j in range(k + 1, n):
+                A[P[i], Q[j]] -= L_ik * A[P[k], Q[j]]
+
+    # Expose rank/tolerance for downstream routines / tests
     global _last_paqlu_rank, _last_paqlu_tol
     _last_paqlu_rank = r
-    _last_paqlu_tol = TOL
+    _last_paqlu_tol = tol if 'tol' in locals() else 0.0
 
     return P, Q, A
 
 
 def solve(A, b):
-    """
-    Solve A x = b using PAQ = LU with general solution x = N x_free + c.
-    Returns (N, c) where columns of N span the null space of A and c is a particular solution.
-    If the system is inconsistent, raises ValueError.
-    """
     if not isinstance(A, np.ndarray):
         raise TypeError("A must be a numpy.ndarray")
     if A.ndim != 2:
         raise ValueError("A must be two-dimensional")
-
     m, n = A.shape
 
+    # Shape/convert b
     b_arr = np.asarray(b)
     if b_arr.ndim == 1:
         if b_arr.size != m:
@@ -104,125 +82,102 @@ def solve(A, b):
             raise ValueError("b has incompatible shape")
     else:
         raise ValueError("b must be one- or two-dimensional")
-    k_rhs = b_arr.shape[1]
+    k = b_arr.shape[1]
 
-    # Explicit empty-shape edge cases
+    # Edge: m == 0 (no equations) ⇒ any x works; choose c = 0, N = I
     if m == 0:
         if b_arr.size != 0:
             raise ValueError("inconsistent system: no equations but nonzero b")
         N = np.eye(n, dtype=A.dtype)
-        c = np.zeros((n, k_rhs), dtype=A.dtype)
-        return N, (c.reshape(n) if k_rhs == 1 else c)
+        c = np.zeros((n, k), dtype=A.dtype)
+        return N, (c.reshape(n) if k == 1 else c)
 
+    # Edge: n == 0 (no variables) ⇒ only consistent if b ≈ 0
     if n == 0:
-        tol = 1e-6
-        if not np.allclose(b_arr, 0, atol=tol):
+        eps0 = np.finfo(A.real.dtype).eps
+        scaleb0 = np.max(np.abs(b_arr)) if b_arr.size else 1.0
+        tol0 = max(m, n) * eps0 * max(1.0, scaleb0)
+        if b_arr.size and np.linalg.norm(b_arr, ord=np.inf) > tol0:
             raise ValueError("inconsistent system: no variables but nonzero b")
         N = np.zeros((0, 0), dtype=A.dtype)
-        c = np.zeros((0, k_rhs), dtype=A.dtype)
-        return N, (c.reshape(0) if k_rhs == 1 else c)
+        c = np.zeros((0, k), dtype=A.dtype)
+        return N, (c.reshape(0) if k == 1 else c)
 
-    # Compute PAQ = LU in-place on a working copy
+    # Work on a copy for in-place PAQ=LU
     A_work = np.array(A, copy=True)
     P, Q, A_work = paqlu_decomposition_in_place(A_work)
 
-    tol = globals().get("_last_paqlu_tol", 1e-6)
-    r = globals().get("_last_paqlu_rank", None)
+    # Robust solve-stage tolerance (don’t rely solely on _last_paqlu_tol)
+    eps = np.finfo(A.real.dtype).eps
+    scaleA = np.max(np.abs(A_work)) if A_work.size else 1.0
+    scaleb = np.max(np.abs(b_arr)) if b_arr.size else 1.0
+    tol_solve = max(m, n) * eps * max(scaleA, scaleb)
+    tol = max(globals().get('_last_paqlu_tol', 0.0), tol_solve)
 
-    # If somehow rank not stored, infer from diagonal of U in pivot ordering
+    # Rank (prefer what PAQ computed; otherwise fallback using tol)
+    r = globals().get('_last_paqlu_rank', None)
     if r is None:
         r = 0
         lim = min(m, n)
         for i in range(lim):
-            if abs(A_work[P[i], Q[i]]) > tol:
+            if np.abs(A_work[P[i], Q[i]]) > tol:
                 r += 1
             else:
                 break
 
-    # Forward substitution for L y = P b (unit diagonal L; L is in columns Q[:r])
+    # Forward substitution: L has unit diagonal; multipliers stored below
     y = b_arr[P, :].astype(A.dtype, copy=True)
     for i in range(m):
-        jmax = min(i, r)
+        jmax = min(i, r)  # only the first r columns are pivots
         if jmax > 0:
-            L_row = A_work[P[i], Q[:jmax]]  # multipliers under pivots for row i
-            # y[i] -= sum_j L[i,j] * y[j] over pivot columns j<jmax
-            y[i, :] -= L_row @ y[:jmax, :]
+            L_row = A_work[P[i], Q[:jmax]]          # shape (jmax,)
+            y[i, :] -= L_row @ y[:jmax, :]          # subtract known part
 
-    # Inconsistency check: rows without pivots must have zero residuals
-    if r < m:
-        if y[r:, :].size and np.max(np.abs(y[r:, :])) > tol:
+    # Inconsistency check: zero rows (below r) must produce zero RHS
+    if r < m and y[r:, :].size:
+        if np.linalg.norm(y[r:, :], ord=np.inf) > tol:
             raise ValueError("inconsistent system: A x = b has no solution")
 
-    # Back substitution for U_piv z = y[:r]
-    U_piv = A_work[np.ix_(P[:r], Q[:r])]
-    z = np.zeros((r, k_rhs), dtype=A.dtype)
+    # Back substitution on U (pivot block)
+    U_piv = A_work[np.ix_(P[:r], Q[:r])]            # r x r upper-triangular
+    z = np.zeros((r, k), dtype=A.dtype)
     for i in range(r - 1, -1, -1):
         rhs = y[i, :].copy()
         if i + 1 < r:
             rhs -= U_piv[i, i + 1 : r] @ z[i + 1 : r, :]
         piv = U_piv[i, i]
-        if abs(piv) <= tol:
+        if np.abs(piv) <= tol:
             raise ValueError("inconsistent system: zero pivot encountered")
         z[i, :] = rhs / piv
 
-    # Particular solution c (set free variables to zero)
-    x_perm = np.zeros((n, k_rhs), dtype=A.dtype)
-    x_perm[:r, :] = z
-    c = np.zeros((n, k_rhs), dtype=A.dtype)
-    c[Q, :] = x_perm
-    if k_rhs == 1:
+    # Particular solution in original column order
+    x_perm = np.zeros((n, k), dtype=A.dtype)
+    x_perm[:r, :] = z                               # pivot vars
+    c = np.zeros((n, k), dtype=A.dtype)
+    c[Q, :] = x_perm                                # inverse permute by Q
+    if k == 1:
         c = c.reshape(n)
 
-    # Nullspace: Solve U_piv * X = -U_free, where U_free are the columns after the pivots
-    f = n - r  # number of free variables
+    # Nullspace basis N (size n x f, with f = n - r)
+    f = n - r
     N = np.zeros((n, f), dtype=A.dtype)
     if f > 0:
-        U_free = -A_work[np.ix_(P[:r], Q[r:n])]
+        # U_piv X = -U_free  ⇒ X via back substitution
+        U_free = -A_work[np.ix_(P[:r], Q[r:n])]     # r x f
         X = np.zeros((r, f), dtype=A.dtype)
         for i in range(r - 1, -1, -1):
             rhs = U_free[i, :].copy()
             if i + 1 < r:
                 rhs -= U_piv[i, i + 1 : r] @ X[i + 1 : r, :]
             piv = U_piv[i, i]
-            if abs(piv) <= tol:
+            if np.abs(piv) <= tol:
                 raise ValueError("inconsistent system: zero pivot in nullspace computation")
             X[i, :] = rhs / piv
 
+        # Stack [X; I_f] in permuted variable order, then inverse-permute by Q
         N_perm = np.zeros((n, f), dtype=A.dtype)
         N_perm[:r, :] = X
-        if f > 0:
-            N_perm[r : r + f, :] = np.eye(f, dtype=A.dtype)
+        N_perm[r : r + f, :] = np.eye(f, dtype=A.dtype)
         N[Q, :] = N_perm
 
     return N, c
-
-
-def general_linear_solver(A, b):
-    """
-    Compatibility wrapper expected by some autograders.
-    Returns (N, c) with N as a 2D ndarray (n x (n-r)), c as a 1D vector when b is 1D.
-    """
-    N, c = solve(A, b)
-    # Ensure N is strictly 2D
-    N = np.asarray(N)
-    if N.ndim == 1:
-        N = N.reshape((N.shape[0], 1))
-    elif N.ndim == 0:
-        N = np.zeros((0, 0), dtype=N.dtype)
-    return N, c
-
-# Some graders might call a differently named API; provide aliases.
-def solve_Nc(A, b):
-    return general_linear_solver(A, b)
-
-def solve_cN(A, b):
-    """
-    Alternate ordering, returns (c, N). Provided just in case a different harness expects this.
-    """
-    N, c = solve(A, b)
-    N = np.asarray(N)
-    if N.ndim == 1:
-        N = N.reshape((N.shape[0], 1))
-    elif N.ndim == 0:
-        N = np.zeros((0, 0), dtype=N.dtype)
-    return c, N

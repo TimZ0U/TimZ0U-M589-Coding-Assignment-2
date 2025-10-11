@@ -1,241 +1,163 @@
 import numpy as np
 
-def paqlu_decomposition_in_place(A, tol=1e-6):
+def paqlu_decomposition(A):
 
-    if not isinstance(A, np.ndarray):
-        raise TypeError("A must be a numpy.ndarray")
+    A = np.array(A, copy=True)  
     if A.ndim != 2:
-        raise ValueError("A must be two-dimensional")
-    if not np.issubdtype(A.dtype, np.inexact):
-        raise TypeError("A must be float/complex; cannot change dtype in-place")
+        raise ValueError("A must be a two-dimensional array")
     m, n = A.shape
+    if not (np.issubdtype(A.dtype, np.floating) or np.issubdtype(A.dtype, np.complexfloating)):
+        raise TypeError("A's dtype is not a supported numeric type (float or complex)")
     P = np.arange(m, dtype=int)
     Q = np.arange(n, dtype=int)
-    r = 0
+    r = 0  
+    eps = np.finfo(A.dtype).eps if np.issubdtype(A.dtype, np.floating) else np.finfo(np.float64).eps
     for k in range(min(m, n)):
-        S = A[k:, k:]
-        if S.size == 0:
-            break
-        S_abs = np.abs(S)
-        max_abs = S_abs.max()
+        sub_rows = P[k:m]
+        sub_cols = Q[k:n]
+        if sub_rows.size == 0 or sub_cols.size == 0:
+            break  
+        submatrix = A[np.ix_(sub_rows, sub_cols)]
+        max_idx = np.unravel_index(np.nanargmax(np.abs(submatrix)), submatrix.shape)
+        pivot_val = submatrix[max_idx]
+        max_abs = np.abs(pivot_val)
+        tol = max(m, n) * eps * np.abs(submatrix).max()  
         if max_abs <= tol:
             break
-        i_rel, j_rel = np.unravel_index(S_abs.argmax(), S_abs.shape)
-        pr = k + i_rel  
-        pc = k + j_rel  
-        if pr != k:
-            A[[k, pr], :] = A[[pr, k], :]
-            P[[k, pr]] = P[[pr, k]]
-        if pc != k:
-            A[:, [k, pc]] = A[:, [pc, k]]
-            Q[[k, pc]] = Q[[pc, k]]
-        piv = A[k, k]
-        for i in range(k+1, m):
-            A[i, k] = A[i, k] / piv
-        for i in range(k+1, m):
-            factor = A[i, k]
-            A[i, k+1:n] -= factor * A[k, k+1:n]
-        r += 1
-    return P, Q, A
+        pivot_row = sub_rows[max_idx[0]]
+        pivot_col = sub_cols[max_idx[1]]
+        if pivot_row != P[k]:
+            piv_idx = np.where(P == pivot_row)[0][0] 
+            P[k], P[piv_idx] = P[piv_idx], P[k]
+        if pivot_col != Q[k]:
+            piv_jdx = np.where(Q == pivot_col)[0][0]  
+            Q[k], Q[piv_jdx] = Q[piv_jdx], Q[k]
+        pivot = A[P[k], Q[k]]
+        for i_idx in range(k+1, m):
+            i = P[i_idx]            
+            factor = A[i, Q[k]] / pivot  
+            A[i, Q[k]] = factor     
+            A[i, Q[k+1:n]] -= factor * A[P[k], Q[k+1:n]]
+        r += 1  
+
+    L = np.zeros((m, r), dtype=A.dtype)
+    U = np.zeros((r, n), dtype=A.dtype)
+    for i in range(m):
+        for j in range(min(r, m)):  
+            if i == j and j < r:
+                L[i, j] = 1  
+            elif i > j and j < r:
+                L[i, j] = A[P[i], Q[j]] 
+    for i in range(r):
+        for j in range(n):
+            if i <= j:
+                U[i, j] = A[P[i], Q[j]]  
+            else:
+                U[i, j] = 0  
+    return P.copy(), Q.copy(), L, U
+
+def paqlu_decomposition_in_place(A):
+
+    if A.ndim != 2:
+        raise ValueError("A must be a two-dimensional array")
+    m, n = A.shape
+    if not (np.issubdtype(A.dtype, np.floating) or np.issubdtype(A.dtype, np.complexfloating)):
+        raise TypeError("A's dtype is not a supported numeric type (float or complex)")
+    P, Q, L, U = paqlu_decomposition(A)
+    r = L.shape[1]  
+    A[...] = 0
+    for i in range(r):
+        row = P[i]
+        for j in range(n):
+            col = Q[j]
+            if i <= j < n:
+                A[row, col] = U[i, j]
+    for j in range(r):
+        col = Q[j]
+        for i_idx in range(j+1, m):
+            A[P[i_idx], col] = L[P[i_idx], j] if j < L.shape[1] else 0
+    return P, Q  
 
 def solve(A, b):
-
+    """
+    Solve A x = b for x = N @ x_free + c, where columns of N form a basis of nullspace and c is a particular solution.
+    Returns (N, c).
+    """
     if not isinstance(A, np.ndarray):
-        raise TypeError("A must be a numpy.ndarray")
+        A = np.array(A)
+    if not isinstance(b, np.ndarray):
+        b = np.array(b)
     if A.ndim != 2:
-        raise ValueError("A must be two-dimensional")
+        raise ValueError("A must be a 2D array")
     m, n = A.shape
-
-    b_arr = np.asarray(b)
-    out_dtype = np.complex128 if (np.iscomplexobj(A) or np.iscomplexobj(b_arr)) else np.float64
-    if b_arr.ndim == 1:
-        if b_arr.size != m:
-            A_work = np.array(A, dtype=out_dtype, copy=True)
-            P, Q, A_work = paqlu_decomposition_in_place(A_work, tol=1e-6)
-            lim = min(m, n)
-            r = 0
-            for i in range(lim):
-                if np.abs(A_work[i, i]) > 1e-6:
-                    r += 1
-                else:
-                    break
-            f = n - r
-            N = np.zeros((n, f), dtype=out_dtype)
-            if f > 0:
-                U_piv = A_work[:r, :r]
-                U_free = -A_work[:r, r:n]
-                X = np.zeros((r, f), dtype=out_dtype)
-                for j in range(r - 1, -1, -1):
-                    piv = U_piv[j, j]
-                    if np.abs(piv) <= 1e-6:
-                        return None, N
-                    rhs = U_free[j, :].copy()
-                    if j + 1 < r:
-                        rhs -= U_piv[j, j+1:r] @ X[j+1:r, :]
-                    X[j, :] = rhs / piv
-                N_perm = np.zeros((n, f), dtype=out_dtype)
-                N_perm[:r, :] = X
-                if f > 0:
-                    N_perm[r:r+f, :] = np.eye(f, dtype=out_dtype)
-                N[Q, :] = N_perm
-            return None, N
-        b_arr = b_arr.reshape(m, 1)  
-    elif b_arr.ndim == 2:
-        if b_arr.shape[0] != m:
-            A_work = np.array(A, dtype=out_dtype, copy=True)
-            P, Q, A_work = paqlu_decomposition_in_place(A_work, tol=1e-6)
-            lim = min(m, n)
-            r = 0
-            for i in range(lim):
-                if np.abs(A_work[i, i]) > 1e-6:
-                    r += 1
-                else:
-                    break
-            f = n - r
-            N = np.zeros((n, f), dtype=out_dtype)
-            if f > 0:
-                U_piv = A_work[:r, :r]
-                U_free = -A_work[:r, r:n]
-                X = np.zeros((r, f), dtype=out_dtype)
-                for j in range(r - 1, -1, -1):
-                    piv = U_piv[j, j]
-                    if np.abs(piv) <= 1e-6:
-                        return None, N
-                    rhs = U_free[j, :].copy()
-                    if j + 1 < r:
-                        rhs -= U_piv[j, j+1:r] @ X[j+1:r, :]
-                    X[j, :] = rhs / piv
-                N_perm = np.zeros((n, f), dtype=out_dtype)
-                N_perm[:r, :] = X
-                if f > 0:
-                    N_perm[r:r+f, :] = np.eye(f, dtype=out_dtype)
-                N[Q, :] = N_perm
-            return None, N
-    else:
-        A_work = np.array(A, dtype=out_dtype, copy=True)
-        P, Q, A_work = paqlu_decomposition_in_place(A_work, tol=1e-6)
-        lim = min(m, n)
-        r = 0
-        for i in range(lim):
-            if np.abs(A_work[i, i]) > 1e-6:
-                r += 1
-            else:
-                break
-        f = n - r
-        N = np.zeros((n, f), dtype=out_dtype)
-        if f > 0:
-            U_piv = A_work[:r, :r]
-            U_free = -A_work[:r, r:n]
-            X = np.zeros((r, f), dtype=out_dtype)
-            for j in range(r - 1, -1, -1):
-                piv = U_piv[j, j]
-                if np.abs(piv) <= 1e-6:
-                    return None, N
-                rhs = U_free[j, :].copy()
-                if j + 1 < r:
-                    rhs -= U_piv[j, j+1:r] @ X[j+1:r, :]
-                X[j, :] = rhs / piv
-            N_perm = np.zeros((n, f), dtype=out_dtype)
-            N_perm[:r, :] = X
-            if f > 0:
-                N_perm[r:r+f, :] = np.eye(f, dtype=out_dtype)
-            N[Q, :] = N_perm
-        return None, N
-
-    k = b_arr.shape[1]  
-    tol = 1e-6
-
-    A_work = np.array(A, dtype=out_dtype, copy=True)
-    P, Q, A_work = paqlu_decomposition_in_place(A_work, tol=tol)
-
-    lim = min(m, n)
+    if b.ndim == 1:
+        b = b.reshape(-1, 1)
+    elif b.ndim > 2:
+        raise ValueError("b must be a 1D or 2D array (vector or matrix of RHS)")
+    if b.shape[0] != m:
+        raise ValueError("Incompatible dimensions: A is %d×%d, but b is length %d" % (m, n, b.shape[0]))
+    if m == 0:
+        if b.size != 0:
+            raise ValueError("Inconsistent system: A has 0 rows but b is not empty")
+        N = np.eye(n, dtype=A.dtype)
+        c = np.zeros((n, b.shape[1]), dtype=A.dtype) if b.shape[1] > 1 else np.zeros(n, dtype=A.dtype)
+        return N, c
+    if n == 0:
+        if np.any(b != 0):
+            raise ValueError("inconsistent system: A x = b has no solution (A has 0 columns but b is nonzero)")
+        N = np.empty((0, 0), dtype=A.dtype)
+        c = np.empty((0, b.shape[1]), dtype=A.dtype) if b.shape[1] > 1 else np.empty((0,), dtype=A.dtype)
+        return N, c
+    P, Q = paqlu_decomposition_in_place(A)
     r = 0
-    for i in range(lim):
-        if np.abs(A_work[i, i]) > tol:
-            r += 1
-        else:
+    min_mn = min(m, n)
+    for i in range(min_mn):
+        if abs(A[P[i], Q[i]]) <= max(m, n) * np.finfo(A.dtype).eps * np.abs(A[P[i:], :][:, Q[i:]]).max():
             break
-    f = n - r  
-
-    y = b_arr[P, :].astype(out_dtype, copy=True)
+        r += 1
+    b_permuted = b[P, :]
+    y = np.array(b_permuted, dtype=A.dtype, copy=True)  
     for i in range(m):
-        jmax = min(i, r)
-        if jmax > 0:
-            y[i, :] -= A_work[i, :jmax] @ y[:jmax, :]
+        j_max = min(i, r)
+        for j in range(j_max):
+            y[i, :] -= A[P[i], Q[j]] * y[j, :]
+        if i < r:
+            pass
+        else:
+            if np.linalg.norm(y[i, :], ord=np.inf) > max(m, n) * np.finfo(A.dtype).eps * np.linalg.norm(b_permuted, ord=np.inf):
+                raise ValueError("inconsistent system: A x = b has no solution")
+    z = np.zeros((r, b.shape[1]), dtype=A.dtype)
+    for i in range(r-1, -1, -1):
+        z[i, :] = y[i, :]
+        for j in range(i+1, r):
+            z[i, :] -= A[P[i], Q[j]] * z[j, :]
+        pivot_val = A[P[i], Q[i]]
+        if abs(pivot_val) <= np.finfo(A.dtype).eps * 10:  # check for near-zero pivot
+            raise ValueError("inconsistent system: singular pivot encountered")
+        z[i, :] /= pivot_val
+    x_perm = np.vstack([z, np.zeros((n - r, b.shape[1]), dtype=A.dtype)])
 
-    if r < m and y[r:, :].size:
-        if np.linalg.norm(y[r:, :], ord=np.inf) > tol:
-            N = np.zeros((n, f), dtype=out_dtype)
-            if f > 0:
-                U_piv = A_work[:r, :r]
-                U_free = -A_work[:r, r:n]
-                X = np.zeros((r, f), dtype=out_dtype)
-                for j in range(r - 1, -1, -1):
-                    piv = U_piv[j, j]
-                    if np.abs(piv) <= tol:
-                        return None, N
-                    rhs = U_free[j, :].copy()
-                    if j + 1 < r:
-                        rhs -= U_piv[j, j+1:r] @ X[j+1:r, :]
-                    X[j, :] = rhs / piv
-                N_perm = np.zeros((n, f), dtype=out_dtype)
-                N_perm[:r, :] = X
-                if f > 0:
-                    N_perm[r:r+f, :] = np.eye(f, dtype=out_dtype)
-                N[Q, :] = N_perm
-            return None, N
+    Q_inv = np.argsort(Q)
+    c_full = x_perm[Q_inv, :]
+    if c_full.shape[1] == 1:
+        c_full = c_full[:, 0]
+    f = n - r  
+    if f <= 0:
+        N = np.empty((n, 0), dtype=A.dtype)
+    else:
+        N = np.zeros((n, f), dtype=A.dtype)
+        free_indices_perm = np.arange(r, n)  
+        for idx, j in enumerate(free_indices_perm):
 
-    U_piv = A_work[:r, :r]
-    z = np.zeros((r, k), dtype=out_dtype)
-    for i in range(r - 1, -1, -1):
-        piv = U_piv[i, i]
-        if np.abs(piv) <= tol:
-            N = np.zeros((n, f), dtype=out_dtype)
-            if f > 0:
-                U_free = -A_work[:r, r:n]
-                X = np.zeros((r, f), dtype=out_dtype)
-                for j in range(r - 1, -1, -1):
-                    piv2 = U_piv[j, j]
-                    if np.abs(piv2) <= tol:
-                        break
-                    rhs2 = U_free[j, :].copy()
-                    if j + 1 < r:
-                        rhs2 -= U_piv[j, j+1:r] @ X[j+1:r, :]
-                    X[j, :] = rhs2 / piv2
-                N_perm = np.zeros((n, f), dtype=out_dtype)
-                N_perm[:r, :] = X
-                if f > 0:
-                    N_perm[r:r+f, :] = np.eye(f, dtype=out_dtype)
-                N[Q, :] = N_perm
-            return None, N
-        rhs = y[i, :].copy()
-        if i + 1 < r:
-            rhs -= U_piv[i, i+1:r] @ z[i+1:r, :]
-        z[i, :] = rhs / piv
-
-    x_perm = np.zeros((n, k), dtype=out_dtype)
-    x_perm[:r, :] = z            
-    c = np.zeros((n, k), dtype=out_dtype)
-    c[Q, :] = x_perm             
-    if k == 1:
-        c = c.reshape(n)         
-
-    N = np.zeros((n, f), dtype=out_dtype)
-    if f > 0:
-        U_free = -A_work[:r, r:n]         
-        X = np.zeros((r, f), dtype=out_dtype)
-        for i in range(r - 1, -1, -1):
-            piv = U_piv[i, i]
-            if np.abs(piv) <= tol:
-                return None, N
-            rhs = U_free[i, :].copy()
-            if i + 1 < r:
-                rhs -= U_piv[i, i+1:r] @ X[i+1:r, :]
-            X[i, :] = rhs / piv
-        N_perm = np.zeros((n, f), dtype=out_dtype)
-        N_perm[:r, :] = X
-        if f > 0:  
-            N_perm[r:r+f, :] = np.eye(f, dtype=out_dtype)
-        N[Q, :] = N_perm
-
-    return N,c
+            y_free = -A[P[0:r], Q[j]]
+            h = np.zeros(r, dtype=A.dtype)
+            for i in range(r-1, -1, -1):
+                temp = y_free[i]
+                for col in range(i+1, r):
+                    temp -= A[P[i], Q[col]] * h[col]
+                h[i] = temp / A[P[i], Q[i]]
+            x_free = np.zeros(n, dtype=A.dtype)
+            x_free[0:r] = h
+            x_free[j] = 1.0
+            N[:, idx] = x_free[Q_inv]
+    return N, c_full

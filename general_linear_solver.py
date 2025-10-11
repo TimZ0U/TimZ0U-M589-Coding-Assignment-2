@@ -137,4 +137,4 @@ def solve(A, b):
 
         N[Q, :] = N_perm
 
-    return N, c
+    return c, N
